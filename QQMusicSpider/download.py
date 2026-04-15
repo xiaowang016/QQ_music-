@@ -267,69 +267,54 @@ class _CircuitBreaker:
                 self._fail_count = 0
 
 
-_VKEYS_BREAKER   = _CircuitBreaker("VKeys",   fail_threshold=2, cooldown_secs=60)
-_YAOHU_BREAKER   = _CircuitBreaker("Yaohu",   fail_threshold=2, cooldown_secs=60)
-_XIANYUW_BREAKER = _CircuitBreaker("Xianyuw", fail_threshold=2, cooldown_secs=60)
+_VKEYS_BREAKER   = _CircuitBreaker("VKeys",   fail_threshold=10, cooldown_secs=60)
+_YAOHU_BREAKER   = _CircuitBreaker("Yaohu",   fail_threshold=10, cooldown_secs=60)
+_XIANYUW_BREAKER = _CircuitBreaker("Xianyuw", fail_threshold=10, cooldown_secs=60)
 
 
 def _fetch_from_vkeys(song_mid, timeout=10, lossless_only=False):
-    """通过 api.vkeys.cn 获取下载链接。
-    lossless_only=True 时只接受 flac/ape/wav，返回 MP3 则直接放弃（不浪费时间继续试低档位）。
-    """
+    """通过 api.vkeys.cn 获取下载链接。只请求一次最高档位，没有就放弃。"""
     if _VKEYS_BREAKER.is_open():
         return None
 
-    for i, quality in enumerate(_VKEYS_QUALITIES):
-        if i > 0:
-            time.sleep(1)  # 两次请求之间间隔 1s
-        try:
-            with _VKEYS_SEMAPHORE:
-                resp = _api_pool.request(
-                    "GET", f"https://api.vkeys.cn/v2/music/tencent/geturl?mid={song_mid}&quality={quality}",
-                    headers={"User-Agent": random_user_agent()}, timeout=timeout,
-                )
-            data = json.loads(resp.data.decode("utf-8"))
-            url = (data.get("data") or {}).get("url", "")
-            if url and url.startswith("http"):
-                ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
-                if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
-                    ext = "mp3"
-                if lossless_only and ext not in _LOSSLESS_EXTS:
-                    return None
-                _VKEYS_BREAKER.record_success()
-                return {"url": url, "file_name": f"{song_mid}.{ext}", "extension": f".{ext}",
-                        "quality": f"vkeys-{quality}", "source": "vkeys"}
-            else:
-                # 当前档位无资源，vkeys 低档位也不会有，直接放弃
-                _VKEYS_BREAKER.record_failure()
+    quality = _VKEYS_QUALITIES[0]  # 只试最高档位
+    try:
+        with _VKEYS_SEMAPHORE:
+            resp = _api_pool.request(
+                "GET", f"https://api.vkeys.cn/v2/music/tencent/geturl?mid={song_mid}&quality={quality}",
+                headers={"User-Agent": random_user_agent()}, timeout=timeout,
+            )
+        data = json.loads(resp.data.decode("utf-8"))
+        url = (data.get("data") or {}).get("url", "")
+        if url and url.startswith("http"):
+            ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
+            if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
+                ext = "mp3"
+            if lossless_only and ext not in _LOSSLESS_EXTS:
                 return None
-        except Exception:
+            _VKEYS_BREAKER.record_success()
+            return {"url": url, "file_name": f"{song_mid}.{ext}", "extension": f".{ext}",
+                    "quality": f"vkeys-{quality}", "source": "vkeys"}
+        else:
             _VKEYS_BREAKER.record_failure()
-            continue
-    return None
+            return None
+    except Exception:
+        _VKEYS_BREAKER.record_failure()
+        return None
 
 
 _YAOHU_KEYS = ["9fheo4Yh7qHhVQhpk4c"]  # 妖狐 API Key
 
 def _fetch_from_yaohu(song_mid, media_mid=None, timeout=15, lossless_only=False, cookie=""):
-    """
-    通过 api.yaohud.cn 获取下载链接。
-    文档规范：hires(HiRes), sq(无损), hq(320k), mp3(128k)
-    内置熔断：连续失败自动冷却。
-    """
+    """通过 api.yaohud.cn 获取下载链接。只请求一次最高音质，没有就放弃。"""
     if _YAOHU_BREAKER.is_open():
         return None
 
     import base64 as _b64
     key = random.choice(_YAOHU_KEYS)
+    size = "sq" if lossless_only else "hires"  # 只试一个档位
 
-    # 映射音质
-    if lossless_only:
-        size_list = ["hires", "sq"]
-    else:
-        size_list = ["hires", "sq", "hq", "mp3"]
-
-    # 构建 Cookie 参数 (按照文档要求仅保留 qm_keyst 和 uin)
+    # 构建 Cookie 参数
     encoded_cookie = ""
     if cookie:
         try:
@@ -345,61 +330,44 @@ def _fetch_from_yaohu(song_mid, media_mid=None, timeout=15, lossless_only=False,
         except Exception:
             pass
 
-    for i, size in enumerate(size_list):
-        if i > 0:
-            time.sleep(1)  # 两次请求之间间隔 1s
-        try:
-            with _YAOHU_SEMAPHORE:
-                params = {
-                    "key": key,
-                    "mid": song_mid,
-                    "type": "url",
-                    "size": size,
-                    "format": "json"
-                }
-                if media_mid:
-                    params["media_mid"] = media_mid
-                if encoded_cookie:
-                    params["cookie"] = encoded_cookie
+    try:
+        with _YAOHU_SEMAPHORE:
+            params = {
+                "key": key, "mid": song_mid, "type": "url",
+                "size": size, "format": "json"
+            }
+            if media_mid:
+                params["media_mid"] = media_mid
+            if encoded_cookie:
+                params["cookie"] = encoded_cookie
 
-                query_str = urllib.parse.urlencode(params)
-                url = f"https://api.yaohud.cn/api/qqmusic/v2?{query_str}"
+            query_str = urllib.parse.urlencode(params)
+            url = f"https://api.yaohud.cn/api/qqmusic/v2?{query_str}"
+            resp = _api_pool.request("GET", url, headers={"User-Agent": random_user_agent()}, timeout=timeout)
 
-                resp = _api_pool.request("GET", url, headers={"User-Agent": random_user_agent()}, timeout=timeout)
-                if resp.status != 200:
-                    _YAOHU_BREAKER.record_failure()
-                    continue
+            if resp.status != 200:
+                _YAOHU_BREAKER.record_failure()
+                return None
 
-                raw_data = resp.data.decode("utf-8")
-                data = json.loads(raw_data)
-
-                if data.get("code") == 200:
-                    info = data.get("data") or {}
-                    if isinstance(info, str):
-                        play_url = info
-                    else:
-                        play_url = info.get("url", "")
-
-                    if play_url and play_url.startswith("http"):
-                        ext = play_url.split("?")[0].rsplit(".", 1)[-1].lower()
-                        if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
-                            ext = "flac" if size in ("hires", "sq") else "mp3"
-                        _YAOHU_BREAKER.record_success()
-                        return {
-                            "url": play_url,
-                            "file_name": f"{song_mid}.{ext}",
-                            "extension": f".{ext}",
-                            "quality": f"yaohu-{size}",
-                            "source": "yaohu"
-                        }
-                else:
-                    _YAOHU_BREAKER.record_failure()
-                    if data.get("code") == 403:
-                        break
-        except Exception:
+            data = json.loads(resp.data.decode("utf-8"))
+            if data.get("code") == 200:
+                info = data.get("data") or {}
+                play_url = info if isinstance(info, str) else info.get("url", "")
+                if play_url and play_url.startswith("http"):
+                    ext = play_url.split("?")[0].rsplit(".", 1)[-1].lower()
+                    if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
+                        ext = "flac" if size in ("hires", "sq") else "mp3"
+                    _YAOHU_BREAKER.record_success()
+                    return {
+                        "url": play_url, "file_name": f"{song_mid}.{ext}",
+                        "extension": f".{ext}", "quality": f"yaohu-{size}",
+                        "source": "yaohu"
+                    }
             _YAOHU_BREAKER.record_failure()
-            continue
-    return None
+            return None
+    except Exception:
+        _YAOHU_BREAKER.record_failure()
+        return None
 
 
 def _fetch_from_thirdparty(song_mid, media_mid=None, timeout=10, lossless_only=False, cookie=""):
@@ -437,47 +405,39 @@ def set_xianyuw_keys(keys):
 
 
 def _fetch_from_xianyuw(song_mid, timeout=10, lossless_only=False):
-    """通过 apii.xianyuw.cn 获取下载链接，轮询所有 key 直到成功（付费渠道，最后兜底）。
-    lossless_only=True 时只接受 flac/ape/wav。
-    内置熔断：连续失败自动冷却，避免白烧请求配额。
-    """
+    """通过 apii.xianyuw.cn 获取下载链接。只用一个 key 请求一次，没有就放弃。"""
     if _XIANYUW_BREAKER.is_open():
         return None
 
-    keys = _XIANYUW_KEYS[:]
-    random.shuffle(keys)
-    for i, key in enumerate(keys):
-        if i > 0:
-            time.sleep(1)  # 两次请求之间间隔 1s
-        try:
-            # 单 IP 100 次/分钟限速
-            if not _XIANYUW_RATE_LIMITER.acquire(timeout=30):
-                return None
-            with _XIANYUW_SEMAPHORE:
-                resp = _api_pool.request(
-                    "GET", f"https://apii.xianyuw.cn/api/v1/qq-music-search?id={song_mid}&key={key}&no_url=0&br=hires",
-                    headers={"User-Agent": random_user_agent()}, timeout=timeout,
-                )
-            if resp.status != 200:
-                _XIANYUW_BREAKER.record_failure()
-                continue
-            data = json.loads(resp.data.decode("utf-8"))
-            url = (data.get("data") or {}).get("url", "")
-            if url and url.startswith("http"):
-                ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
-                if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
-                    ext = "mp3"
-                if lossless_only and ext not in _LOSSLESS_EXTS:
-                    return None
-                _XIANYUW_BREAKER.record_success()
-                return {"url": url, "file_name": f"{song_mid}.{ext}", "extension": f".{ext}",
-                        "quality": "xianyuw-hires", "source": "xianyuw"}
-            else:
-                _XIANYUW_BREAKER.record_failure()
-        except Exception:
+    key = random.choice(_XIANYUW_KEYS)
+    try:
+        if not _XIANYUW_RATE_LIMITER.acquire(timeout=30):
+            return None
+        with _XIANYUW_SEMAPHORE:
+            resp = _api_pool.request(
+                "GET", f"https://apii.xianyuw.cn/api/v1/qq-music-search?id={song_mid}&key={key}&no_url=0&br=hires",
+                headers={"User-Agent": random_user_agent()}, timeout=timeout,
+            )
+        if resp.status != 200:
             _XIANYUW_BREAKER.record_failure()
-            continue
-    return None
+            return None
+        data = json.loads(resp.data.decode("utf-8"))
+        url = (data.get("data") or {}).get("url", "")
+        if url and url.startswith("http"):
+            ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
+            if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
+                ext = "mp3"
+            if lossless_only and ext not in _LOSSLESS_EXTS:
+                return None
+            _XIANYUW_BREAKER.record_success()
+            return {"url": url, "file_name": f"{song_mid}.{ext}", "extension": f".{ext}",
+                    "quality": "xianyuw-hires", "source": "xianyuw"}
+        else:
+            _XIANYUW_BREAKER.record_failure()
+            return None
+    except Exception:
+        _XIANYUW_BREAKER.record_failure()
+        return None
 
 
 def fetch_download_info_with_fallback(song_mid, media_mid=None, quality="flac", cookie="", uin="0", timeout=20, prefer_thirdparty=False):
