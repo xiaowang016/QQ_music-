@@ -411,7 +411,7 @@ def _fetch_from_xianyuw(song_mid, timeout=10, lossless_only=False):
 
     key = random.choice(_XIANYUW_KEYS)
     try:
-        if not _XIANYUW_RATE_LIMITER.acquire(timeout=30):
+        if not _XIANYUW_RATE_LIMITER.acquire(timeout=5):
             return None
         with _XIANYUW_SEMAPHORE:
             resp = _api_pool.request(
@@ -442,45 +442,18 @@ def _fetch_from_xianyuw(song_mid, timeout=10, lossless_only=False):
 
 def fetch_download_info_with_fallback(song_mid, media_mid=None, quality="flac", cookie="", uin="0", timeout=20, prefer_thirdparty=False):
     """
-    两阶段策略：先穷尽所有渠道的无损，全无无损才降级到 MP3。
-    如果 prefer_thirdparty=True，则在每一阶段都优先尝试第三方/付费 API。
+    第三方 API 只调一次（不限音质，拿到什么算什么），然后官方逐级降档。
     """
     last_error = None
 
-    # ── 阶段1：所有渠道只取无损 ────────────────────────────────────
-    
-    # 如果优先第三方，则先尝试第三方无损
-    if prefer_thirdparty:
-        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=True, cookie=cookie)
-        if result:
-            return result
-
-    # 官方无损
-    for q in ("flac", "ape"):
-        try:
-            info = fetch_download_info(song_mid, media_mid=media_mid, quality=q,
-                                       cookie=cookie, uin=uin, timeout=timeout)
-            info["actual_quality"] = q
-            return info
-        except QQMusicDownloadError as exc:
-            last_error = exc
-
-    # 如果没开启优先第三方，则在官方无损失败后尝试第三方无损
-    if not prefer_thirdparty:
-        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=True, cookie=cookie)
-        if result:
-            return result
-
-    # ── 阶段2：无损全军覆没，降级到有损 ────────────────────────────
-    
-    # 如果优先第三方，先尝试第三方有损
+    # ── 第三方：只请求一次，不分无损/有损 ──────────────────────────
     if prefer_thirdparty:
         result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
         if result:
             return result
 
-    # 官方有损
-    for q in ("320", "128", "m4a"):
+    # ── 官方：逐级降档 ────────────────────────────────────────────
+    for q in ("flac", "ape", "320", "128", "m4a"):
         try:
             info = fetch_download_info(song_mid, media_mid=media_mid, quality=q,
                                        cookie=cookie, uin=uin, timeout=timeout)
@@ -489,7 +462,7 @@ def fetch_download_info_with_fallback(song_mid, media_mid=None, quality="flac", 
         except QQMusicDownloadError as exc:
             last_error = exc
 
-    # 官方有损失败后尝试第三方有损
+    # ── 官方全挂，最后兜底第三方 ──────────────────────────────────
     if not prefer_thirdparty:
         result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
         if result:
