@@ -1,7 +1,7 @@
 {
     "api_url": "http://192.168.10.165:8080",
-    "qqmusic_cookie": "",
-    "qqmusic_uin": "",
+    "qqmusic_cookie": "qq_domain_video_guid_verify=774fc0620e756cad; _qimei_uuid42=1a3100c172310022b473af438c4998c9c2a460a615; _qimei_fingerprint=1f1fc625f215c02b62a3865d841b80ba; _qimei_q36=; _qimei_h38=59a968b8b473af438c4998c902000006c1a310; pgv_pvid=1160369284; _qimei_i_3=5de65fd09d5a5589c096ac32098c21b6a3eeacf24653028bb2897b587093266e336461943c89e29992bf; _qimei_i_2=4dc977e1dd39; _qimei_i_1=7fd345879c0b59ddc9c5f6625f8370b1a1eaa7f9415f0a8bbcdc21582493206c616331c639d8e1ddd693dee0; _qimei_q32=; fqm_pvqid=e12e7866-4d6c-4ef9-b9a8-5ab459f513ea; ts_uid=8099041902; RK=RIQHKZPAXK; ptcz=ac4227a351f2bd6a184513489f1c55b69bcbd2c990e4d32807c0d3007dfa5985; music_ignore_pskey=202306271436Hn@vBj; yqq_stat=0; _qpsvr_localtk=0.03914565091747968; pgv_info=ssid=s3430773008; fqm_sessionid=1e6dcafe-47b8-436a-8ebb-e3793ec53d61; tmeLoginType=2; ts_refer=www.bing.com/; login_type=1; qm_keyst=Q_H_L_63k3NAtc_k1OQD9LptdAxHoed3vIwY6GOFwDLIsKMk0z5o5gP0aUEHttVzwgEwSkvuXm712zr_H5XbE3S5aAlDM42; psrf_qqaccess_token=F689073B6BE4850FC6DE2237CECCED00; uin=813150785; qqmusic_key=Q_H_L_63k3NAtc_k1OQD9LptdAxHoed3vIwY6GOFwDLIsKMk0z5o5gP0aUEHttVzwgEwSkvuXm712zr_H5XbE3S5aAlDM42; psrf_access_token_expiresAt=1781416142; wxrefresh_token=; psrf_musickey_createtime=1776232142; psrf_qqunionid=E80F5FAADB5D98A4782B64A8D9323690; psrf_qqrefresh_token=C11470C5A23DE8AB5F499778647C43BC; euin=Ne6ioK4z7ick; wxunionid=; wxopenid=; psrf_qqopenid=29BDE366D9FDACAF9F21A8A1D06007C4",
+    "qqmusic_uin": "813150785",
     "output_dir": "Y:\\0413QQ音乐下载\\测试",
     "threads": 9,
     "download_quality": "flac",

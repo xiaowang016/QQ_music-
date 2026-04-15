@@ -833,15 +833,41 @@ def _release_slot(state):
 def resolve_download_auth(args):
     if has_explicit_auth(args.qqmusic_cookie, args.qqmusic_uin):
         return args.qqmusic_cookie, args.qqmusic_uin
+
+    # ── 优先从中央 Cookie API 拉取 ──────────────────────────────
+    for attempt in range(3):
+        try:
+            resp = _api_http.request(
+                "GET", f"{args.api_url}/cookies/get",
+                timeout=urllib3.Timeout(connect=5, read=10),
+            )
+            if resp.status == 200:
+                data = json.loads(resp.data.decode("utf-8"))
+                cookie = data.get("cookie", "")
+                uin = data.get("uin", "0")
+                if cookie:
+                    log.info("[启动] 从中央 Cookie 池获取 VIP Cookie 成功  uin=%s", uin)
+                    return cookie, uin
+            log.warning("[启动] 中央 Cookie 池暂无有效 Cookie (attempt %d/3)", attempt + 1)
+        except Exception as exc:
+            log.warning("[启动] 拉取中央 Cookie 失败: %s (attempt %d/3)", exc, attempt + 1)
+        if attempt < 2:
+            time.sleep(3)
+
+    # ── 降级：本地 Playwright profile ────────────────────────────
     try:
         cookie, uin = load_auth_from_playwright_profile(
             user_data_dir=args.comment_fallback_profile_dir,
             browser_channel=args.comment_fallback_browser_channel,
             headful=args.comment_fallback_headful,
         )
+        log.info("[启动] 从本地 Playwright Profile 获取 Cookie  uin=%s", uin)
         return cookie, uin
     except QQMusicDownloadError:
-        return args.qqmusic_cookie, args.qqmusic_uin
+        pass
+
+    log.warning("[启动] 未获取到任何 Cookie，将以空 Cookie 启动（仅能下载低音质）")
+    return args.qqmusic_cookie, args.qqmusic_uin
 
 
 # Cookie 自动刷新间隔（秒）
