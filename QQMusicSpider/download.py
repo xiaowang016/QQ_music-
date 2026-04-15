@@ -31,17 +31,31 @@ _api_pool = urllib3.PoolManager(
     timeout=urllib3.Timeout(connect=10, read=30),
 )
 
-# 咸鱼专用连接池（可选代理，解决直连不通的问题）
-_XIANYUW_PROXY = "http://127.0.0.1:7890"   # 走代理访问咸鱼
-if _XIANYUW_PROXY:
-    _xianyuw_pool = urllib3.ProxyManager(
-        _XIANYUW_PROXY,
-        num_pools=4, maxsize=10,
-        retries=urllib3.Retry(total=1, backoff_factor=0.5, raise_on_status=False),
-        timeout=urllib3.Timeout(connect=3, read=5),
-    )
-else:
-    _xianyuw_pool = _api_pool
+# 咸鱼专用连接池（双代理端口自动探测）
+_XIANYUW_PROXY_PORTS = [7890, 7897]
+
+def _create_xianyuw_pool():
+    """尝试双代理端口，哪个通用哪个；都不通则直连。"""
+    for port in _XIANYUW_PROXY_PORTS:
+        proxy_url = f"http://127.0.0.1:{port}"
+        try:
+            test_pool = urllib3.ProxyManager(
+                proxy_url, num_pools=1, maxsize=1,
+                timeout=urllib3.Timeout(connect=2, read=3),
+            )
+            test_pool.request("GET", "https://apii.xianyuw.cn", preload_content=False).release_conn()
+            print(f"[proxy] 咸鱼代理探测成功: {proxy_url}")
+            return urllib3.ProxyManager(
+                proxy_url, num_pools=4, maxsize=10,
+                retries=urllib3.Retry(total=1, backoff_factor=0.5, raise_on_status=False),
+                timeout=urllib3.Timeout(connect=3, read=5),
+            )
+        except Exception:
+            print(f"[proxy] 端口 {port} 不可用，尝试下一个...")
+    print("[proxy] 所有代理端口均不可用，咸鱼使用直连")
+    return _api_pool
+
+_xianyuw_pool = _create_xianyuw_pool()
 
 # 下载专用连接池：与 API 池严格隔离，防止流式下载残留数据污染 API 连接
 _download_pool = urllib3.PoolManager(
