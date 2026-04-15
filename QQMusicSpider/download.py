@@ -282,7 +282,8 @@ def _fetch_from_vkeys(song_mid, timeout=10, lossless_only=False):
         with _VKEYS_SEMAPHORE:
             resp = _api_pool.request(
                 "GET", f"https://api.vkeys.cn/v2/music/tencent/geturl?mid={song_mid}&quality={quality}",
-                headers={"User-Agent": random_user_agent()}, timeout=timeout,
+                headers={"User-Agent": random_user_agent()},
+                timeout=urllib3.Timeout(connect=3, read=5),
             )
         data = json.loads(resp.data.decode("utf-8"))
         url = (data.get("data") or {}).get("url", "")
@@ -343,7 +344,8 @@ def _fetch_from_yaohu(song_mid, media_mid=None, timeout=15, lossless_only=False,
 
             query_str = urllib.parse.urlencode(params)
             url = f"https://api.yaohud.cn/api/qqmusic/v2?{query_str}"
-            resp = _api_pool.request("GET", url, headers={"User-Agent": random_user_agent()}, timeout=timeout)
+            resp = _api_pool.request("GET", url, headers={"User-Agent": random_user_agent()},
+                                     timeout=urllib3.Timeout(connect=3, read=5))
 
             if resp.status != 200:
                 _YAOHU_BREAKER.record_failure()
@@ -416,7 +418,8 @@ def _fetch_from_xianyuw(song_mid, timeout=10, lossless_only=False):
         with _XIANYUW_SEMAPHORE:
             resp = _api_pool.request(
                 "GET", f"https://apii.xianyuw.cn/api/v1/qq-music-search?id={song_mid}&key={key}&no_url=0&br=hires",
-                headers={"User-Agent": random_user_agent()}, timeout=timeout,
+                headers={"User-Agent": random_user_agent()},
+                timeout=urllib3.Timeout(connect=3, read=5),
             )
         if resp.status != 200:
             _XIANYUW_BREAKER.record_failure()
