@@ -1,0 +1,657 @@
+# -*- coding: utf-8 -*-
+
+import json
+import random
+import re
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+import urllib3
+
+from QQMusicSpider.utils import random_user_agent
+
+try:
+    from playwright.sync_api import sync_playwright
+except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+    sync_playwright = None
+
+
+# API 请求连接池（获取 vkey、第三方 API 等短请求）
+_api_pool = urllib3.PoolManager(
+    num_pools=10,
+    maxsize=30,
+    retries=urllib3.Retry(
+        total=3, backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    ),
+    timeout=urllib3.Timeout(connect=10, read=30),
+)
+
+# 下载专用连接池：与 API 池严格隔离，防止流式下载残留数据污染 API 连接
+_download_pool = urllib3.PoolManager(
+    num_pools=4,
+    maxsize=8,
+    retries=urllib3.Retry(
+        total=3, backoff_factor=2.0,
+        status_forcelist=[500, 502, 503],
+        allowed_methods=["GET"],
+    ),
+    timeout=urllib3.Timeout(connect=10, read=120),
+)
+DOWNLOAD_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+PLAY_SIGN = "zzannc1o6o9b4i971602f3554385022046ab796512b7012"
+FILE_TYPES = {
+    "m4a": {"prefix": "C400", "extension": ".m4a"},
+    "128": {"prefix": "M500", "extension": ".mp3"},
+    "320": {"prefix": "M800", "extension": ".mp3"},
+    "ape": {"prefix": "A000", "extension": ".ape"},
+    "flac": {"prefix": "F000", "extension": ".flac"},
+}
+
+
+class QQMusicDownloadError(Exception):
+    pass
+
+
+def normalize_cookie(cookie):
+    text = str(cookie or "").strip()
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    if lowered in {"cookie", "your_cookie", "你的cookie", "浣犵殑cookie"}:
+        return ""
+
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError:
+        return ""
+    return text
+
+
+def normalize_uin(configured_uin):
+    text = str(configured_uin or "").strip()
+    if not text:
+        return "0"
+
+    lowered = text.lower()
+    if lowered in {"uin", "your_uin", "你的uin", "浣犵殑uin"}:
+        return "0"
+
+    if text.isdigit():
+        return text
+    return "0"
+
+
+def has_explicit_auth(cookie="", uin="0"):
+    return bool(normalize_cookie(cookie)) or normalize_uin(uin) != "0"
+
+
+def resolve_uin(cookie, configured_uin):
+    text = normalize_uin(configured_uin)
+    if text and text != "0":
+        return text
+
+    cookie = normalize_cookie(cookie)
+    if not cookie:
+        return "0"
+
+    match = re.search(r"(?:^|;\s*)uin=([^;]+)", cookie)
+    if match:
+        return match.group(1).strip()
+    return "0"
+
+
+def load_auth_from_playwright_profile(user_data_dir, browser_channel="msedge", headful=False):
+    if sync_playwright is None:
+        raise QQMusicDownloadError("Playwright is not installed")
+
+    profile_dir = Path(user_data_dir or "").expanduser()
+    if not profile_dir.exists():
+        raise QQMusicDownloadError(f"Playwright profile does not exist: {profile_dir}")
+
+    try:
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel=browser_channel or None,
+                headless=not headful,
+                args=["--disable-blink-features=AutomationControlled"],
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            try:
+                raw_cookies = context.cookies(
+                    [
+                        "https://y.qq.com",
+                        "https://qq.com",
+                        "https://u.y.qq.com",
+                        "https://c.y.qq.com",
+                    ]
+                )
+            finally:
+                context.close()
+    except Exception as exc:
+        raise QQMusicDownloadError(f"Failed to load auth from Playwright profile: {exc}") from exc
+
+    qq_cookies = []
+    seen_names = set()
+    for item in raw_cookies or []:
+        domain = str(item.get("domain") or "")
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "")
+        if not name or name in seen_names:
+            continue
+        if "qq.com" not in domain:
+            continue
+        qq_cookies.append(f"{name}={value}")
+        seen_names.add(name)
+
+    cookie = "; ".join(qq_cookies)
+    cookie = normalize_cookie(cookie)
+    if not cookie:
+        raise QQMusicDownloadError("No QQ cookies found in Playwright profile")
+
+    uin = resolve_uin(cookie, "0")
+    return cookie, uin
+
+
+def build_headers(cookie="", host="u.y.qq.com"):
+    headers = {
+        "User-Agent": random_user_agent(),
+        "Referer": "https://y.qq.com/portal/player.html",
+        "Host": host,
+    }
+    cookie = normalize_cookie(cookie)
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def resolve_play_path(play_info):
+    """从 play_info 中提取可用的播放路径覆盖多种音质。"""
+    for key in (
+        "purl", "wifiurl", "flowurl", "opi128kurl", "opi192kurl",
+        "opi96kurl", "opi48kurl", "opiflackurl", "opi30surl",
+    ):
+        value = play_info.get(key) or ""
+        if value:
+            return value
+    return ""
+
+
+QUALITY_FALLBACK_ORDER = ["flac", "ape", "320", "128", "m4a"]
+
+# ============================================================
+#  第三方 API fallback（官方接口失败时降级）
+# ============================================================
+
+# VKeys API 音质映射: 值越大音质越高
+_VKEYS_QUALITIES = [14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+
+# Tang API / NKI API 音质字段优先级
+_THIRDPARTY_URL_KEYS = [
+    "song_play_url_sq", "song_play_url_pq", "song_play_url_accom",
+    "song_play_url_hq", "song_play_url", "song_play_url_standard", "song_play_url_fq",
+]
+
+
+_LOSSLESS_EXTS = {"flac", "ape", "wav"}
+
+# 限制第三方 API 并发数，防止远端服务器被打爆而断连
+_VKEYS_SEMAPHORE   = threading.Semaphore(15)   # vkeys 最多同时 5 个请求
+_XIANYUW_SEMAPHORE = threading.Semaphore(25)   # xianyuw 最多同时 12 个请求
+_YAOHU_SEMAPHORE   = threading.Semaphore(20)   # 妖狐数据 API 并发限制
+
+
+class _TokenBucket:
+    """线程安全令牌桶：限制单机请求频率（每分钟 N 次）。"""
+
+    def __init__(self, rate_per_min: int):
+        self.rate = rate_per_min
+        self.tokens = float(rate_per_min)
+        self.last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, timeout: float = 60.0) -> bool:
+        """阻塞直到获取一个令牌，超时返回 False。"""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self.last_refill
+                self.tokens = min(self.rate, self.tokens + elapsed * (self.rate / 60.0))
+                self.last_refill = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.5, remaining))
+
+
+# 咸鱼 API 单 IP 限制 100 次/分钟，留余量控制在 90
+_XIANYUW_RATE_LIMITER = _TokenBucket(90)
+
+
+class _CircuitBreaker:
+    """熔断器：连续失败 N 次后冷却一段时间，避免白烧请求。"""
+
+    def __init__(self, name: str, fail_threshold: int = 5, cooldown_secs: float = 60):
+        self.name = name
+        self.fail_threshold = fail_threshold
+        self.cooldown_secs = cooldown_secs
+        self._fail_count = 0
+        self._cooldown_until = 0.0
+        self._lock = threading.Lock()
+
+    def is_open(self) -> bool:
+        """冷却中返回 True（熔断打开，应跳过请求）。"""
+        return time.monotonic() < self._cooldown_until
+
+    def record_success(self):
+        with self._lock:
+            self._fail_count = 0
+
+    def record_failure(self):
+        with self._lock:
+            self._fail_count += 1
+            if self._fail_count >= self.fail_threshold:
+                self._cooldown_until = time.monotonic() + self.cooldown_secs
+                print(f"[{self.name}] 连续 {self._fail_count} 次失败，冷却 {self.cooldown_secs}s")
+                self._fail_count = 0
+
+
+_VKEYS_BREAKER   = _CircuitBreaker("VKeys",   fail_threshold=2, cooldown_secs=60)
+_YAOHU_BREAKER   = _CircuitBreaker("Yaohu",   fail_threshold=2, cooldown_secs=60)
+_XIANYUW_BREAKER = _CircuitBreaker("Xianyuw", fail_threshold=2, cooldown_secs=60)
+
+
+def _fetch_from_vkeys(song_mid, timeout=10, lossless_only=False):
+    """通过 api.vkeys.cn 获取下载链接。
+    lossless_only=True 时只接受 flac/ape/wav，返回 MP3 则直接放弃（不浪费时间继续试低档位）。
+    """
+    if _VKEYS_BREAKER.is_open():
+        return None
+
+    for i, quality in enumerate(_VKEYS_QUALITIES):
+        if i > 0:
+            time.sleep(1)  # 两次请求之间间隔 1s
+        try:
+            with _VKEYS_SEMAPHORE:
+                resp = _api_pool.request(
+                    "GET", f"https://api.vkeys.cn/v2/music/tencent/geturl?mid={song_mid}&quality={quality}",
+                    headers={"User-Agent": random_user_agent()}, timeout=timeout,
+                )
+            data = json.loads(resp.data.decode("utf-8"))
+            url = (data.get("data") or {}).get("url", "")
+            if url and url.startswith("http"):
+                ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
+                if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
+                    ext = "mp3"
+                if lossless_only and ext not in _LOSSLESS_EXTS:
+                    return None
+                _VKEYS_BREAKER.record_success()
+                return {"url": url, "file_name": f"{song_mid}.{ext}", "extension": f".{ext}",
+                        "quality": f"vkeys-{quality}", "source": "vkeys"}
+            else:
+                # 当前档位无资源，vkeys 低档位也不会有，直接放弃
+                _VKEYS_BREAKER.record_failure()
+                return None
+        except Exception:
+            _VKEYS_BREAKER.record_failure()
+            continue
+    return None
+
+
+_YAOHU_KEYS = ["9fheo4Yh7qHhVQhpk4c"]  # 妖狐 API Key
+
+def _fetch_from_yaohu(song_mid, media_mid=None, timeout=15, lossless_only=False, cookie=""):
+    """
+    通过 api.yaohud.cn 获取下载链接。
+    文档规范：hires(HiRes), sq(无损), hq(320k), mp3(128k)
+    内置熔断：连续失败自动冷却。
+    """
+    if _YAOHU_BREAKER.is_open():
+        return None
+
+    import base64 as _b64
+    key = random.choice(_YAOHU_KEYS)
+
+    # 映射音质
+    if lossless_only:
+        size_list = ["hires", "sq"]
+    else:
+        size_list = ["hires", "sq", "hq", "mp3"]
+
+    # 构建 Cookie 参数 (按照文档要求仅保留 qm_keyst 和 uin)
+    encoded_cookie = ""
+    if cookie:
+        try:
+            qm_keyst = ""
+            uin = ""
+            m_keyst = re.search(r"qm_keyst=([^;]+)", cookie)
+            if m_keyst: qm_keyst = m_keyst.group(1).strip()
+            m_uin = re.search(r"uin=([^;]+)", cookie)
+            if m_uin: uin = m_uin.group(1).strip()
+            if qm_keyst and uin:
+                target_cookie = f"qm_keyst={qm_keyst}; uin={uin}"
+                encoded_cookie = _b64.b64encode(target_cookie.encode("utf-8")).decode("utf-8")
+        except Exception:
+            pass
+
+    for i, size in enumerate(size_list):
+        if i > 0:
+            time.sleep(1)  # 两次请求之间间隔 1s
+        try:
+            with _YAOHU_SEMAPHORE:
+                params = {
+                    "key": key,
+                    "mid": song_mid,
+                    "type": "url",
+                    "size": size,
+                    "format": "json"
+                }
+                if media_mid:
+                    params["media_mid"] = media_mid
+                if encoded_cookie:
+                    params["cookie"] = encoded_cookie
+
+                query_str = urllib.parse.urlencode(params)
+                url = f"https://api.yaohud.cn/api/qqmusic/v2?{query_str}"
+
+                resp = _api_pool.request("GET", url, headers={"User-Agent": random_user_agent()}, timeout=timeout)
+                if resp.status != 200:
+                    _YAOHU_BREAKER.record_failure()
+                    continue
+
+                raw_data = resp.data.decode("utf-8")
+                data = json.loads(raw_data)
+
+                if data.get("code") == 200:
+                    info = data.get("data") or {}
+                    if isinstance(info, str):
+                        play_url = info
+                    else:
+                        play_url = info.get("url", "")
+
+                    if play_url and play_url.startswith("http"):
+                        ext = play_url.split("?")[0].rsplit(".", 1)[-1].lower()
+                        if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
+                            ext = "flac" if size in ("hires", "sq") else "mp3"
+                        _YAOHU_BREAKER.record_success()
+                        return {
+                            "url": play_url,
+                            "file_name": f"{song_mid}.{ext}",
+                            "extension": f".{ext}",
+                            "quality": f"yaohu-{size}",
+                            "source": "yaohu"
+                        }
+                else:
+                    _YAOHU_BREAKER.record_failure()
+                    if data.get("code") == 403:
+                        break
+        except Exception:
+            _YAOHU_BREAKER.record_failure()
+            continue
+    return None
+
+
+def _fetch_from_thirdparty(song_mid, media_mid=None, timeout=10, lossless_only=False, cookie=""):
+    """依次尝试第三方 API，返回第一个成功的结果。"""
+    # 策略调整：妖狐数据优先于 xianyuw 和 vkeys
+    fetch_funcs = [
+        lambda: _fetch_from_yaohu(song_mid, media_mid, timeout, lossless_only, cookie=cookie),
+        lambda: _fetch_from_vkeys(song_mid, timeout, lossless_only),
+        lambda: _fetch_from_xianyuw(song_mid, timeout, lossless_only),
+    ]
+    for func in fetch_funcs:
+        try:
+            result = func()
+            if result:
+                # 统一设置 actual_quality
+                result["actual_quality"] = result.get("quality", "thirdparty")
+                return result
+        except Exception:
+            continue
+    return None
+
+
+_XIANYUW_KEYS = [
+    "sk-950e7813c38c2e31d39d879d32048895",
+    "sk-62cdb03e2270eb3968cca7881399f412",
+    "sk-e551ad8ff431c1dae080d34199ba7612",
+    "sk-c9f43eaaf82767433a8a544f6b6170b7",
+]
+
+
+def set_xianyuw_keys(keys):
+    global _XIANYUW_KEYS
+    if keys and isinstance(keys, list):
+        _XIANYUW_KEYS = keys
+
+
+def _fetch_from_xianyuw(song_mid, timeout=10, lossless_only=False):
+    """通过 apii.xianyuw.cn 获取下载链接，轮询所有 key 直到成功（付费渠道，最后兜底）。
+    lossless_only=True 时只接受 flac/ape/wav。
+    内置熔断：连续失败自动冷却，避免白烧请求配额。
+    """
+    if _XIANYUW_BREAKER.is_open():
+        return None
+
+    keys = _XIANYUW_KEYS[:]
+    random.shuffle(keys)
+    for i, key in enumerate(keys):
+        if i > 0:
+            time.sleep(1)  # 两次请求之间间隔 1s
+        try:
+            # 单 IP 100 次/分钟限速
+            if not _XIANYUW_RATE_LIMITER.acquire(timeout=30):
+                return None
+            with _XIANYUW_SEMAPHORE:
+                resp = _api_pool.request(
+                    "GET", f"https://apii.xianyuw.cn/api/v1/qq-music-search?id={song_mid}&key={key}&no_url=0&br=hires",
+                    headers={"User-Agent": random_user_agent()}, timeout=timeout,
+                )
+            if resp.status != 200:
+                _XIANYUW_BREAKER.record_failure()
+                continue
+            data = json.loads(resp.data.decode("utf-8"))
+            url = (data.get("data") or {}).get("url", "")
+            if url and url.startswith("http"):
+                ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
+                if ext not in ("mp3", "flac", "m4a", "ogg", "ape", "wav"):
+                    ext = "mp3"
+                if lossless_only and ext not in _LOSSLESS_EXTS:
+                    return None
+                _XIANYUW_BREAKER.record_success()
+                return {"url": url, "file_name": f"{song_mid}.{ext}", "extension": f".{ext}",
+                        "quality": "xianyuw-hires", "source": "xianyuw"}
+            else:
+                _XIANYUW_BREAKER.record_failure()
+        except Exception:
+            _XIANYUW_BREAKER.record_failure()
+            continue
+    return None
+
+
+def fetch_download_info_with_fallback(song_mid, media_mid=None, quality="flac", cookie="", uin="0", timeout=20, prefer_thirdparty=False):
+    """
+    两阶段策略：先穷尽所有渠道的无损，全无无损才降级到 MP3。
+    如果 prefer_thirdparty=True，则在每一阶段都优先尝试第三方/付费 API。
+    """
+    last_error = None
+
+    # ── 阶段1：所有渠道只取无损 ────────────────────────────────────
+    
+    # 如果优先第三方，则先尝试第三方无损
+    if prefer_thirdparty:
+        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=True, cookie=cookie)
+        if result:
+            return result
+
+    # 官方无损
+    for q in ("flac", "ape"):
+        try:
+            info = fetch_download_info(song_mid, media_mid=media_mid, quality=q,
+                                       cookie=cookie, uin=uin, timeout=timeout)
+            info["actual_quality"] = q
+            return info
+        except QQMusicDownloadError as exc:
+            last_error = exc
+
+    # 如果没开启优先第三方，则在官方无损失败后尝试第三方无损
+    if not prefer_thirdparty:
+        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=True, cookie=cookie)
+        if result:
+            return result
+
+    # ── 阶段2：无损全军覆没，降级到有损 ────────────────────────────
+    
+    # 如果优先第三方，先尝试第三方有损
+    if prefer_thirdparty:
+        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
+        if result:
+            return result
+
+    # 官方有损
+    for q in ("320", "128", "m4a"):
+        try:
+            info = fetch_download_info(song_mid, media_mid=media_mid, quality=q,
+                                       cookie=cookie, uin=uin, timeout=timeout)
+            info["actual_quality"] = q
+            return info
+        except QQMusicDownloadError as exc:
+            last_error = exc
+
+    # 官方有损失败后尝试第三方有损
+    if not prefer_thirdparty:
+        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
+        if result:
+            return result
+
+    raise QQMusicDownloadError(f"All sources and qualities failed for {song_mid}: {last_error}")
+
+
+def fetch_download_info(song_mid, media_mid=None, quality="128", cookie="", uin="0", timeout=20):
+    if quality not in FILE_TYPES:
+        raise QQMusicDownloadError(f"Unsupported quality: {quality}")
+
+    cookie = normalize_cookie(cookie)
+    uin = normalize_uin(uin)
+    song_mid = str(song_mid or "").strip()
+    if not song_mid:
+        raise QQMusicDownloadError("Missing song_mid")
+
+    media_mid = str(media_mid or song_mid).strip()
+    file_info = FILE_TYPES[quality]
+    filename = f'{file_info["prefix"]}{song_mid}{media_mid}{file_info["extension"]}'
+    resolved_uin = resolve_uin(cookie, uin)
+    guid = str(random.randint(1_000_000_000, 9_999_999_999))
+
+    request_data = {
+        "req_0": {
+            "module": "vkey.GetVkeyServer",
+            "method": "CgiGetVkey",
+            "param": {
+                "filename": [filename],
+                "guid": guid,
+                "songmid": [song_mid],
+                "songtype": [0],
+                "uin": resolved_uin,
+                "loginflag": 1,
+                "platform": "20",
+            },
+        },
+        "loginUin": resolved_uin,
+        "comm": {
+            "uin": resolved_uin,
+            "format": "json",
+            "ct": 24,
+            "cv": 0,
+        },
+    }
+    params = {
+        "g_tk": 1124214810, "loginUin": resolved_uin, "hostUin": 0,
+        "format": "json", "sign": PLAY_SIGN,
+        "data": json.dumps(request_data, ensure_ascii=False, separators=(",", ":")),
+    }
+    request_url = f"{DOWNLOAD_URL}?{urllib.parse.urlencode(params)}"
+    
+    try:
+        resp = _api_pool.request("GET", request_url, headers=build_headers(cookie=cookie), timeout=timeout)
+        payload = json.loads(resp.data.decode("utf-8"))
+    except Exception as exc:
+        raise QQMusicDownloadError(f"Failed to fetch play URL: {exc}") from exc
+
+    data = payload.get("req_0", {}).get("data", {})
+    sip_list = data.get("sip") or []
+    # 优先选择非 http://ws 开头的域名作为主域名（同步自 D 盘稳定版本逻辑）
+    domain = next((item for item in sip_list if not item.startswith("http://ws")), sip_list[0] if sip_list else "")
+    
+    midurlinfo = data.get("midurlinfo") or []
+    if not midurlinfo:
+        raise QQMusicDownloadError("QQ Music did not return midurlinfo")
+
+    play_info = midurlinfo[0]
+    play_path = resolve_play_path(play_info)
+    if not play_path or not domain:
+        message = play_info.get("msg") or "No playable URL returned"
+        raise QQMusicDownloadError(message)
+
+    resolved_url = play_path if (play_path.startswith("http://") or play_path.startswith("https://")) else f"{domain}{play_path}"
+
+    return {
+        "url": resolved_url,
+        "file_name": f"{song_mid}{file_info['extension']}",
+        "extension": file_info["extension"],
+        "quality": quality,
+    }
+
+
+def save_song_file(download_url, destination, cookie="", timeout=60):
+    destination = Path(destination)
+    # 强制确保父目录存在且路径无末尾空格（双重保障）
+    parent = Path(str(destination.parent).rstrip())
+    parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = parent / (destination.name + ".tmp")
+    cookie = normalize_cookie(cookie)
+    parsed = urllib.parse.urlparse(download_url)
+    headers = build_headers(cookie=cookie, host=parsed.netloc)
+    # Connection: close 确保下载完毕后连接不被放回池中，防止残留 MP3 数据污染后续 API 请求
+    headers["Connection"] = "close"
+
+    try:
+        resp = _download_pool.request(
+            "GET", download_url, headers=headers, timeout=timeout, preload_content=False,
+        )
+        if resp.status not in (200, 206):
+            resp.drain_conn()
+            raise QQMusicDownloadError(f"HTTP {resp.status} from CDN")
+        try:
+            with tmp_path.open("wb") as file_obj:
+                for chunk in resp.stream(1024 * 64):
+                    file_obj.write(chunk)
+        finally:
+            # close() 关闭底层 socket，不归还给连接池
+            resp.close()
+        tmp_path.replace(parent / destination.name)
+    except QQMusicDownloadError:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise QQMusicDownloadError(f"Failed to download song file: {exc}") from exc

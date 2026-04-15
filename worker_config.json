@@ -1,0 +1,13 @@
+{
+    "api_url": "http://192.168.10.165:8080",
+    "qqmusic_cookie": "",
+    "qqmusic_uin": "",
+    "output_dir": "Y:\\0413QQ音乐下载\\测试",
+    "threads": 9,
+    "download_quality": "flac",
+    "batch_size": 50,
+    "api_qps": 100,
+    "flush_interval": 3.0,
+    "lease_seconds": 3600,
+    "idle_seconds": 10
+}
