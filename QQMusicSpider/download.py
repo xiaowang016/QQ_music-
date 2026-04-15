@@ -440,27 +440,102 @@ def _fetch_from_xianyuw(song_mid, timeout=10, lossless_only=False):
         return None
 
 
+def fetch_download_info_batch(song_mid, media_mid=None, cookie="", uin="0", timeout=15):
+    """一次请求所有音质，返回最高可用音质的下载信息。5 次请求合并为 1 次。"""
+    cookie = normalize_cookie(cookie)
+    uin = normalize_uin(uin)
+    song_mid = str(song_mid or "").strip()
+    if not song_mid:
+        raise QQMusicDownloadError("Missing song_mid")
+
+    media_mid = str(media_mid or song_mid).strip()
+    resolved_uin = resolve_uin(cookie, uin)
+    guid = str(random.randint(1_000_000_000, 9_999_999_999))
+
+    # 按优先级排列：flac > ape > 320 > 128 > m4a
+    qualities = ["flac", "ape", "320", "128", "m4a"]
+    filenames = []
+    songmids = []
+    songtypes = []
+    for q in qualities:
+        fi = FILE_TYPES[q]
+        filenames.append(f'{fi["prefix"]}{song_mid}{media_mid}{fi["extension"]}')
+        songmids.append(song_mid)
+        songtypes.append(0)
+
+    request_data = {
+        "req_0": {
+            "module": "vkey.GetVkeyServer",
+            "method": "CgiGetVkey",
+            "param": {
+                "filename": filenames,
+                "guid": guid,
+                "songmid": songmids,
+                "songtype": songtypes,
+                "uin": resolved_uin,
+                "loginflag": 1,
+                "platform": "20",
+            },
+        },
+        "loginUin": resolved_uin,
+        "comm": {
+            "uin": resolved_uin, "format": "json", "ct": 24, "cv": 0,
+        },
+    }
+    params = {
+        "g_tk": 1124214810, "loginUin": resolved_uin, "hostUin": 0,
+        "format": "json", "sign": PLAY_SIGN,
+        "data": json.dumps(request_data, ensure_ascii=False, separators=(",", ":")),
+    }
+    request_url = f"{DOWNLOAD_URL}?{urllib.parse.urlencode(params)}"
+
+    try:
+        resp = _api_pool.request("GET", request_url, headers=build_headers(cookie=cookie), timeout=timeout)
+        payload = json.loads(resp.data.decode("utf-8"))
+    except Exception as exc:
+        raise QQMusicDownloadError(f"Failed to fetch play URL: {exc}") from exc
+
+    data = payload.get("req_0", {}).get("data", {})
+    sip_list = data.get("sip") or []
+    domain = next((item for item in sip_list if not item.startswith("http://ws")), sip_list[0] if sip_list else "")
+    midurlinfo = data.get("midurlinfo") or []
+
+    # 按优先级遍历，返回第一个有 URL 的
+    for i, q in enumerate(qualities):
+        if i >= len(midurlinfo):
+            break
+        play_info = midurlinfo[i]
+        play_path = resolve_play_path(play_info)
+        if play_path and domain:
+            resolved_url = play_path if play_path.startswith("http") else f"{domain}{play_path}"
+            fi = FILE_TYPES[q]
+            return {
+                "url": resolved_url,
+                "file_name": f"{song_mid}{fi['extension']}",
+                "extension": fi["extension"],
+                "quality": q,
+                "actual_quality": q,
+            }
+
+    raise QQMusicDownloadError(f"No playable URL for any quality: {song_mid}")
+
+
 def fetch_download_info_with_fallback(song_mid, media_mid=None, quality="flac", cookie="", uin="0", timeout=20, prefer_thirdparty=False):
     """
-    第三方 API 只调一次（不限音质，拿到什么算什么），然后官方逐级降档。
+    第三方 API 只调一次，官方 API 一次请求全部音质，选最高可用。
     """
-    last_error = None
-
-    # ── 第三方：只请求一次，不分无损/有损 ──────────────────────────
+    # ── 第三方：只请求一次 ──────────────────────────────────────
     if prefer_thirdparty:
         result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
         if result:
             return result
 
-    # ── 官方：逐级降档 ────────────────────────────────────────────
-    for q in ("flac", "ape", "320", "128", "m4a"):
-        try:
-            info = fetch_download_info(song_mid, media_mid=media_mid, quality=q,
-                                       cookie=cookie, uin=uin, timeout=timeout)
-            info["actual_quality"] = q
-            return info
-        except QQMusicDownloadError as exc:
-            last_error = exc
+    # ── 官方：一次请求全部音质，自动选最高 ─────────────────────────
+    try:
+        return fetch_download_info_batch(song_mid, media_mid=media_mid,
+                                          cookie=cookie, uin=uin, timeout=timeout)
+    except QQMusicDownloadError:
+        pass
 
     # ── 官方全挂，最后兜底第三方 ──────────────────────────────────
     if not prefer_thirdparty:
@@ -468,7 +543,7 @@ def fetch_download_info_with_fallback(song_mid, media_mid=None, quality="flac", 
         if result:
             return result
 
-    raise QQMusicDownloadError(f"All sources and qualities failed for {song_mid}: {last_error}")
+    raise QQMusicDownloadError(f"All sources and qualities failed for {song_mid}")
 
 
 def fetch_download_info(song_mid, media_mid=None, quality="128", cookie="", uin="0", timeout=20):
