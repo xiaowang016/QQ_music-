@@ -400,11 +400,11 @@ def _fetch_from_yaohu(song_mid, media_mid=None, timeout=15, lossless_only=False,
 
 def _fetch_from_thirdparty(song_mid, media_mid=None, timeout=10, lossless_only=False, cookie=""):
     """依次尝试第三方 API，返回第一个成功的结果。"""
-    # 策略调整：妖狐数据优先于 xianyuw 和 vkeys
+    # 咸鱼优先，命中率最高
     fetch_funcs = [
+        lambda: _fetch_from_xianyuw(song_mid, timeout, lossless_only),
         lambda: _fetch_from_yaohu(song_mid, media_mid, timeout, lossless_only, cookie=cookie),
         lambda: _fetch_from_vkeys(song_mid, timeout, lossless_only),
-        lambda: _fetch_from_xianyuw(song_mid, timeout, lossless_only),
     ]
     for func in fetch_funcs:
         try:
