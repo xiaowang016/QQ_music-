@@ -262,7 +262,7 @@ class _TokenBucket:
 
 
 # 咸鱼 API 单 IP 限制 100 次/分钟，留余量控制在 90
-_XIANYUW_RATE_LIMITER = _TokenBucket(90)
+_XIANYUW_RATE_LIMITER = _TokenBucket(50)
 
 
 class _CircuitBreaker:
