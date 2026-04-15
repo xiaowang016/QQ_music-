@@ -32,7 +32,7 @@ _api_pool = urllib3.PoolManager(
 )
 
 # 咸鱼专用连接池（可选代理，解决直连不通的问题）
-_XIANYUW_PROXY = ""   # 留空=直连，填写如 "http://127.0.0.1:7890" 走代理
+_XIANYUW_PROXY = "http://127.0.0.1:7890"   # 走代理访问咸鱼
 if _XIANYUW_PROXY:
     _xianyuw_pool = urllib3.ProxyManager(
         _XIANYUW_PROXY,
@@ -405,10 +405,7 @@ def _fetch_from_thirdparty(song_mid, media_mid=None, timeout=10, lossless_only=F
 
 
 _XIANYUW_KEYS = [
-    "sk-950e7813c38c2e31d39d879d32048895",
-    "sk-62cdb03e2270eb3968cca7881399f412",
-    "sk-e551ad8ff431c1dae080d34199ba7612",
-    "sk-c9f43eaaf82767433a8a544f6b6170b7",
+    "sk-c1671e560f93e781eb810047ac1894a3",
 ]
 
 
