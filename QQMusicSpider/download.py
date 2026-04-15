@@ -522,26 +522,29 @@ def fetch_download_info_batch(song_mid, media_mid=None, cookie="", uin="0", time
 
 def fetch_download_info_with_fallback(song_mid, media_mid=None, quality="flac", cookie="", uin="0", timeout=20, prefer_thirdparty=False):
     """
-    第三方 API 只调一次，官方 API 一次请求全部音质，选最高可用。
+    优先无损策略：
+    1. 第三方 API 只取无损（1 轮 3 次请求）
+    2. 官方 API 一次请求全部音质，自动选最高（1 次请求）
+    3. 都没有再兜底第三方取任意音质（1 轮 3 次请求，仅在官方也失败时触发）
+    常规路径最多 4 次请求，不影响效率。
     """
-    # ── 第三方：只请求一次 ──────────────────────────────────────
+    # ── 1. 第三方优先取无损 ────────────────────────────────────────
     if prefer_thirdparty:
-        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
+        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=True, cookie=cookie)
         if result:
             return result
 
-    # ── 官方：一次请求全部音质，自动选最高 ─────────────────────────
+    # ── 2. 官方一次请求全部音质（flac>ape>320>128>m4a）────────────
     try:
         return fetch_download_info_batch(song_mid, media_mid=media_mid,
                                           cookie=cookie, uin=uin, timeout=timeout)
     except QQMusicDownloadError:
         pass
 
-    # ── 官方全挂，最后兜底第三方 ──────────────────────────────────
-    if not prefer_thirdparty:
-        result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
-        if result:
-            return result
+    # ── 3. 官方全挂，兜底第三方取任意音质 ─────────────────────────
+    result = _fetch_from_thirdparty(song_mid, media_mid, timeout=timeout, lossless_only=False, cookie=cookie)
+    if result:
+        return result
 
     raise QQMusicDownloadError(f"All sources and qualities failed for {song_mid}")
 
