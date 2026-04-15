@@ -31,6 +31,18 @@ _api_pool = urllib3.PoolManager(
     timeout=urllib3.Timeout(connect=10, read=30),
 )
 
+# 咸鱼专用连接池（可选代理，解决直连不通的问题）
+_XIANYUW_PROXY = ""   # 留空=直连，填写如 "http://127.0.0.1:7890" 走代理
+if _XIANYUW_PROXY:
+    _xianyuw_pool = urllib3.ProxyManager(
+        _XIANYUW_PROXY,
+        num_pools=4, maxsize=10,
+        retries=urllib3.Retry(total=1, backoff_factor=0.5, raise_on_status=False),
+        timeout=urllib3.Timeout(connect=3, read=5),
+    )
+else:
+    _xianyuw_pool = _api_pool
+
 # 下载专用连接池：与 API 池严格隔离，防止流式下载残留数据污染 API 连接
 _download_pool = urllib3.PoolManager(
     num_pools=4,
@@ -416,7 +428,7 @@ def _fetch_from_xianyuw(song_mid, timeout=10, lossless_only=False):
         if not _XIANYUW_RATE_LIMITER.acquire(timeout=5):
             return None
         with _XIANYUW_SEMAPHORE:
-            resp = _api_pool.request(
+            resp = _xianyuw_pool.request(
                 "GET", f"https://apii.xianyuw.cn/api/v1/qq-music-search?id={song_mid}&key={key}&no_url=0&br=hires",
                 headers={"User-Agent": random_user_agent()},
                 timeout=urllib3.Timeout(connect=3, read=5),
