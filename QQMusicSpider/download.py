@@ -70,6 +70,13 @@ _download_pool = urllib3.PoolManager(
 )
 DOWNLOAD_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
 PLAY_SIGN = "zzannc1o6o9b4i971602f3554385022046ab796512b7012"
+
+# sip 为空时的备选 CDN 域名
+FALLBACK_CDN_DOMAINS = [
+    "http://isure.stream.qqmusic.qq.com/",
+    "http://dl.stream.qqmusic.qq.com/",
+]
+
 FILE_TYPES = {
     "m4a": {"prefix": "C400", "extension": ".m4a"},
     "128": {"prefix": "M500", "extension": ".mp3"},
@@ -549,9 +556,16 @@ def fetch_download_info_batch(song_mid, media_mid=None, cookie="", uin="0", time
             "uin": resolved_uin, "format": "json", "ct": 24, "cv": 0,
         },
     }
+    # 使用动态签名替代静态 PLAY_SIGN
+    try:
+        from QQMusicSpider.sign import sign_request
+        dynamic_sign = sign_request(request_data)
+    except ImportError:
+        dynamic_sign = PLAY_SIGN
+
     params = {
         "g_tk": 1124214810, "loginUin": resolved_uin, "hostUin": 0,
-        "format": "json", "sign": PLAY_SIGN,
+        "format": "json", "sign": dynamic_sign,
         "data": json.dumps(request_data, ensure_ascii=False, separators=(",", ":")),
     }
     request_url = f"{DOWNLOAD_URL}?{urllib.parse.urlencode(params)}"
@@ -564,7 +578,10 @@ def fetch_download_info_batch(song_mid, media_mid=None, cookie="", uin="0", time
 
     data = payload.get("req_0", {}).get("data", {})
     sip_list = data.get("sip") or []
+    # 优先选择非 ws 开头的域名；sip 为空时使用备选 CDN
     domain = next((item for item in sip_list if not item.startswith("http://ws")), sip_list[0] if sip_list else "")
+    if not domain:
+        domain = FALLBACK_CDN_DOMAINS[0] if FALLBACK_CDN_DOMAINS else ""
     midurlinfo = data.get("midurlinfo") or []
 
     # 按优先级遍历，返回第一个有 URL 的
@@ -654,13 +671,20 @@ def fetch_download_info(song_mid, media_mid=None, quality="128", cookie="", uin=
             "cv": 0,
         },
     }
+    # 使用动态签名
+    try:
+        from QQMusicSpider.sign import sign_request
+        dynamic_sign = sign_request(request_data)
+    except ImportError:
+        dynamic_sign = PLAY_SIGN
+
     params = {
         "g_tk": 1124214810, "loginUin": resolved_uin, "hostUin": 0,
-        "format": "json", "sign": PLAY_SIGN,
+        "format": "json", "sign": dynamic_sign,
         "data": json.dumps(request_data, ensure_ascii=False, separators=(",", ":")),
     }
     request_url = f"{DOWNLOAD_URL}?{urllib.parse.urlencode(params)}"
-    
+
     try:
         resp = _api_pool.request("GET", request_url, headers=build_headers(cookie=cookie), timeout=timeout)
         payload = json.loads(resp.data.decode("utf-8"))
@@ -669,8 +693,10 @@ def fetch_download_info(song_mid, media_mid=None, quality="128", cookie="", uin=
 
     data = payload.get("req_0", {}).get("data", {})
     sip_list = data.get("sip") or []
-    # 优先选择非 http://ws 开头的域名作为主域名（同步自 D 盘稳定版本逻辑）
+    # 优先选择非 http://ws 开头的域名作为主域名
     domain = next((item for item in sip_list if not item.startswith("http://ws")), sip_list[0] if sip_list else "")
+    if not domain:
+        domain = FALLBACK_CDN_DOMAINS[0] if FALLBACK_CDN_DOMAINS else ""
     
     midurlinfo = data.get("midurlinfo") or []
     if not midurlinfo:
