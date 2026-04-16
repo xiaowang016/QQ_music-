@@ -16,10 +16,11 @@ if _project_dir not in sys.path:
 
 try:
     from worker_from_api import (
-        feeder_loop, worker_loop, ResultCollector, CookieHolder, 
-        set_comment_auth, set_rate_limit, log as worker_log
+        feeder_loop, worker_loop, ResultCollector, CookieHolder,
+        set_comment_auth, set_rate_limit, _init_comment_rate_limit, log as worker_log
     )
     import worker_from_api
+    from QQMusicSpider.download import set_vkey_rate_limit
 except ImportError:
     pass
 
@@ -201,7 +202,7 @@ class WorkerGUI:
         args.comment_fallback_profile_dir, args.comment_fallback_browser_channel = ".playwright_profile", "msedge"
         args.comment_fallback_headful, args.comment_fallback_wait_seconds = False, 8.0
         
-        set_rate_limit(args.api_qps); set_comment_auth(args.qqmusic_cookie, args.qqmusic_uin)
+        set_rate_limit(args.api_qps); set_comment_auth(args.qqmusic_cookie, args.qqmusic_uin); set_vkey_rate_limit(100); _init_comment_rate_limit(60)
         cookie_holder = CookieHolder(args.qqmusic_cookie, args.qqmusic_uin, args)
         collector = ResultCollector(args.api_url, retry_failed=args.retry_failed, flush_interval=args.flush_interval)
         collector.set_on_update(self.on_stats_update_async); collector.start()

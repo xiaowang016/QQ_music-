@@ -240,6 +240,16 @@ _VKEYS_SEMAPHORE   = threading.Semaphore(15)   # vkeys 最多同时 5 个请求
 _XIANYUW_SEMAPHORE = threading.Semaphore(25)   # xianyuw 最多同时 12 个请求
 _YAOHU_SEMAPHORE   = threading.Semaphore(20)   # 妖狐数据 API 并发限制
 
+# 官方 VKey API 限速：单机每分钟最多 100 次请求，防止触发 QQ 音乐频率限制
+_VKEY_RATE_LIMITER = None  # 延迟初始化，由 set_vkey_rate_limit() 设置
+_VKEY_SEMAPHORE    = threading.Semaphore(5)     # 官方 VKey API 最多同时 5 个并发请求
+
+
+def set_vkey_rate_limit(rate_per_min=100):
+    """设置官方 VKey API 的频率限制（每分钟请求数）。"""
+    global _VKEY_RATE_LIMITER
+    _VKEY_RATE_LIMITER = _TokenBucket(rate_per_min)
+
 
 class _TokenBucket:
     """线程安全令牌桶：限制单机请求频率（每分钟 N 次）。"""
@@ -570,9 +580,15 @@ def fetch_download_info_batch(song_mid, media_mid=None, cookie="", uin="0", time
     }
     request_url = f"{DOWNLOAD_URL}?{urllib.parse.urlencode(params)}"
 
+    # 官方 VKey API 限速
+    if _VKEY_RATE_LIMITER and not _VKEY_RATE_LIMITER.acquire(timeout=30):
+        raise QQMusicDownloadError("VKey API rate limit timeout")
     try:
-        resp = _api_pool.request("GET", request_url, headers=build_headers(cookie=cookie), timeout=timeout)
+        with _VKEY_SEMAPHORE:
+            resp = _api_pool.request("GET", request_url, headers=build_headers(cookie=cookie), timeout=timeout)
         payload = json.loads(resp.data.decode("utf-8"))
+    except QQMusicDownloadError:
+        raise
     except Exception as exc:
         raise QQMusicDownloadError(f"Failed to fetch play URL: {exc}") from exc
 
@@ -685,9 +701,15 @@ def fetch_download_info(song_mid, media_mid=None, quality="128", cookie="", uin=
     }
     request_url = f"{DOWNLOAD_URL}?{urllib.parse.urlencode(params)}"
 
+    # 官方 VKey API 限速
+    if _VKEY_RATE_LIMITER and not _VKEY_RATE_LIMITER.acquire(timeout=30):
+        raise QQMusicDownloadError("VKey API rate limit timeout")
     try:
-        resp = _api_pool.request("GET", request_url, headers=build_headers(cookie=cookie), timeout=timeout)
+        with _VKEY_SEMAPHORE:
+            resp = _api_pool.request("GET", request_url, headers=build_headers(cookie=cookie), timeout=timeout)
         payload = json.loads(resp.data.decode("utf-8"))
+    except QQMusicDownloadError:
+        raise
     except Exception as exc:
         raise QQMusicDownloadError(f"Failed to fetch play URL: {exc}") from exc
 

@@ -72,6 +72,7 @@ from QQMusicSpider.download import (
     has_explicit_auth,
     load_auth_from_playwright_profile,
     save_song_file,
+    set_vkey_rate_limit,
     set_xianyuw_keys,
 )
 from QQMusicSpider.tasks import QQMusicMetadataError, set_rate_limit
@@ -241,6 +242,20 @@ def _jitter():
 #  直连 QQ 音乐 API（评论/歌词，不走系统代理）
 # ============================================================
 
+# 评论 API 限速：防止高频请求触发 QQ 音乐封禁 cookie
+_COMMENT_RATE_LIMIT = 60   # 每分钟最多 60 次评论请求
+_comment_tokens = None      # _TokenBucket，延迟初始化
+_comment_semaphore = threading.Semaphore(3)  # 评论 API 最多同时 3 个并发
+
+
+def _init_comment_rate_limit(rate_per_min=None):
+    global _comment_tokens, _COMMENT_RATE_LIMIT
+    if rate_per_min is not None:
+        _COMMENT_RATE_LIMIT = rate_per_min
+    from QQMusicSpider.download import _TokenBucket
+    _comment_tokens = _TokenBucket(_COMMENT_RATE_LIMIT)
+
+
 _direct_http = urllib3.PoolManager(
     num_pools=20,
     maxsize=120,
@@ -292,9 +307,12 @@ def _fetch_json_direct(url, headers=None, timeout=30):
 
 
 def _post_musicu(req_data, timeout=30, skip_jitter=False):
-    """POST 到 u.y.qq.com/cgi-bin/musicu.fcg，带 cookie 鉴权。"""
+    """POST 到 u.y.qq.com/cgi-bin/musicu.fcg，带 cookie 鉴权 + 限速。"""
     if not skip_jitter:
         _jitter()
+    # 评论 API 限速
+    if _comment_tokens and not _comment_tokens.acquire(timeout=15):
+        raise QQMusicMetadataError("Comment API rate limit timeout")
     payload = json.dumps(req_data, separators=(",", ":")).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
@@ -304,7 +322,8 @@ def _post_musicu(req_data, timeout=30, skip_jitter=False):
     if _comment_cookie:
         headers["Cookie"] = _comment_cookie
     try:
-        resp = _direct_http.request("POST", _MUSICU_URL, body=payload, headers=headers, timeout=timeout)
+        with _comment_semaphore:
+            resp = _direct_http.request("POST", _MUSICU_URL, body=payload, headers=headers, timeout=timeout)
         return json.loads(resp.data.decode("utf-8"))
     except Exception as exc:
         raise QQMusicMetadataError(str(exc)) from exc
@@ -1028,7 +1047,10 @@ def main():
         args.batch_size = min(args.batch_size, args.max_tasks)
 
     set_rate_limit(args.api_qps)
+    set_vkey_rate_limit(100)  # 官方 VKey API 限速：每分钟最多 100 次
+    _init_comment_rate_limit(60)  # 评论 API 限速：每分钟最多 60 次
     log.info("[%s] API 服务: %s", args.worker_id, args.api_url)
+    log.info("[%s] VKey API 限速: 100 次/分, 并发5 | 评论 API 限速: 60 次/分, 并发3", args.worker_id)
     log.info("[%s] 模式: %s | 线程: %d | 批量: %d | 输出: %s",
              args.worker_id, "纯元数据" if args.metadata_only else "含下载",
              args.threads, args.batch_size, args.output_dir)
