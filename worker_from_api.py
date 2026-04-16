@@ -330,12 +330,15 @@ def _post_musicu(req_data, timeout=30, skip_jitter=False):
 
 
 def _fetch_hot_comments_direct(song_id, song_mid, page_size=100, timeout=30):
-    """获取评论：先抓热评，不够则用最新评论补齐到 page_size 条。"""
+    """获取评论：先抓热评，不够则用最新评论补齐到 page_size 条。
+
+    目标：拿够 page_size 条；不足 page_size 则拿全部。
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    _comment_deadline = time.monotonic() + 15  # 整体评论抓取不超过 15 秒
+    _comment_deadline = time.monotonic() + 45  # 加了限速后放宽到 45 秒
     target = page_size
     api_page_size = 25   # 服务端硬限制 PageSize ≤ 25，超过返回 10000
-    _comment_timeout = 8  # 评论请求快速失败
+    _comment_timeout = 10  # 单次请求超时
     collected = []
     seen = set()
 
@@ -429,10 +432,11 @@ def _fetch_hot_comments_direct(song_id, song_mid, page_size=100, timeout=30):
                 break
             _parse_comments(results[pn].get("CommentList", {}).get("Comments", []))
 
-    # === 阶段2：热评不够，用最新评论补齐（最多 4 轮×25=100，受整体截止时间约束） ===
+    # === 阶段2：热评不够，用最新评论补齐（循环翻页直到拿够 target 或没有更多） ===
     if len(collected) < target:
         last_seq = ""
-        for _ in range(4):
+        max_new_rounds = (target - len(collected)) // api_page_size + 2  # 按缺口算轮数，多留余量
+        for _ in range(max_new_rounds):
             if len(collected) >= target or time.monotonic() > _comment_deadline:
                 break
             try:
@@ -498,7 +502,7 @@ def process_task(task, output_dir, quality, cookie, uin, timeout, metadata_only=
 
     comment_thread = threading.Thread(target=_fetch_comments, daemon=True)
     comment_thread.start()
-    comment_thread.join(timeout=20)  # 评论内部已有 15s 截止，这里多留 5s 余量
+    comment_thread.join(timeout=50)  # 评论内部已有 45s 截止，这里多留 5s 余量
 
     if isinstance(comment_result[0], tuple) and len(comment_result[0]) == 4:
         comments, total_comment_count, fav_count, fav_count_text = comment_result[0]
